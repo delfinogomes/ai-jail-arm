@@ -1,0 +1,6 @@
+# Pinned upstream ai-jail release signing keys (40-hex primary fingerprints).
+# Copied from akitaonrails/ai-jail .github/release-keyring/ (added upstream in
+# e8020c441e, 2026-08-16). Upstream tags must be signed by one of these.
+#
+# AkitaOnRails (ai-jail release signing), ed25519, expires 2028-08-15
+268CBE5E8B2D39185E982A51025FFD4C6B0A7DB9

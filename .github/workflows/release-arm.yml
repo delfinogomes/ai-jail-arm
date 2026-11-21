@@ -2,8 +2,17 @@ name: Release ARM64
 
 # Builds Linux aarch64 binaries (tarball + .deb) for every upstream
 # akitaonrails/ai-jail release that does not yet have a release here.
-# Builds run natively on GitHub's ARM runners (free for public repos), so
-# no cross toolchain is involved and upstream's test suite runs on arm64.
+#
+# Trust chain:
+#   1. `verify` (no upstream code executed) accepts an upstream tag only if it
+#      is an annotated tag, reachable from upstream's default branch, matches
+#      Cargo.toml, is GPG-signed by a key pinned in keys/fingerprints.txt of
+#      THIS repo, and upstream's own build-provenance attestation names the
+#      exact same commit. It emits the verified commit SHA.
+#   2. `build` checks out that commit SHA (not the tag, which could move) on a
+#      native ARM runner with a read-only token and no secrets.
+#   3. `release` runs in the `release-publish` environment (manual approval),
+#      attests the artifacts and publishes. Releases are never overwritten.
 
 on:
   schedule:
@@ -14,10 +23,6 @@ on:
         description: "Upstream tag to build (e.g. v3.5.0). Empty = check latest upstream releases."
         required: false
         default: ""
-      force:
-        description: "Rebuild and re-upload assets even if a release already exists here"
-        type: boolean
-        default: false
       skip_tests:
         description: "Skip upstream's cargo test run"
         type: boolean
@@ -32,60 +37,131 @@ concurrency:
 
 env:
   UPSTREAM: akitaonrails/ai-jail
+  UPSTREAM_WORKFLOW: akitaonrails/ai-jail/.github/workflows/release.yml
+  # Upstream asset whose attestation is used to cross-check the source commit.
+  ATTESTED_ASSET: ai-jail-linux-x86_64.tar.gz
   # How many of the newest upstream releases to look at on scheduled runs.
-  # Anything in that window missing here gets built (backfill).
   LOOKBACK: "3"
 
 jobs:
-  check:
+  verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
-      tags: ${{ steps.find.outputs.tags }}
-      latest: ${{ steps.find.outputs.latest }}
+      builds: ${{ steps.verify.outputs.builds }}
+      latest: ${{ steps.verify.outputs.latest }}
     steps:
-      - name: Find upstream releases missing here
-        id: find
+      - name: Check out pinned keys
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          path: self
+          sparse-checkout: keys
+          persist-credentials: false
+
+      - name: Check out upstream (full history, nothing executed)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select and verify upstream tags
+        id: verify
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
-          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
+          fail() { echo "::error title=upstream verification failed::$*"; exit 1; }
+
           latest="$(gh release view -R "$UPSTREAM" --json tagName --jq .tagName)"
           if [ -n "${INPUT_TAG:-}" ]; then
             candidates="$INPUT_TAG"
           else
+            # newest-first from the API; reversed so we publish oldest first
             candidates="$(gh release list -R "$UPSTREAM" -L "$LOOKBACK" \
               --exclude-drafts --exclude-pre-releases \
-              --json tagName --jq '.[].tagName')"
+              --json tagName --jq 'reverse | .[].tagName')"
           fi
 
-          todo=()
+          # Keyring built only from keys committed to THIS repo.
+          export GNUPGHOME="$(mktemp -d)"
+          shopt -s nullglob
+          keys=(self/keys/*.asc self/keys/*.gpg)
+          [ "${#keys[@]}" -gt 0 ] || fail "no keys in keys/"
+          for k in "${keys[@]}"; do gpg --batch --quiet --import "$k"; done
+          pinned="$(grep -Ev '^[[:space:]]*(#|$)' self/keys/fingerprints.txt \
+            | tr -d ' \t' | tr '[:lower:]' '[:upper:]')"
+          [ -n "$pinned" ] || fail "keys/fingerprints.txt has no fingerprints"
+
+          default_branch="$(gh api "repos/$UPSTREAM" --jq .default_branch)"
+          git -C src fetch --quiet origin "$default_branch" --no-tags
+
+          builds='[]'
           for tag in $candidates; do
-            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::warning::skipping non-semver tag '$tag'"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "tag '$tag' is not exact vX.Y.Z"
+
+            # Skip only fully published releases; a leftover draft is retried.
+            draft="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+            if [ "$draft" = "false" ]; then
+              echo "$tag already released here, skipping"
               continue
             fi
-            gh release view "$tag" -R "$UPSTREAM" >/dev/null || {
-              echo "::error::upstream release $tag not found"; exit 1;
-            }
-            if [ "${FORCE:-false}" != "true" ] \
-              && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "$tag already released here"
-              continue
-            fi
-            echo "will build $tag"
-            todo+=("$tag")
+
+            echo "::group::verify $tag"
+            # Fetch the real tag object (never trust a cached/lightweight ref).
+            git -C src fetch --quiet --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            git -C src cat-file -e "${tag}^{tag}" 2>/dev/null \
+              || fail "$tag is a lightweight tag"
+            commit="$(git -C src rev-parse "${tag}^{commit}")"
+
+            git -C src merge-base --is-ancestor "$commit" "origin/$default_branch" \
+              || fail "$tag ($commit) is not reachable from upstream $default_branch"
+
+            cargo_version="$(git -C src show "${commit}:Cargo.toml" \
+              | grep '^version = ' | head -n 1 | cut -d '"' -f 2)"
+            [ "$cargo_version" = "${tag#v}" ] \
+              || fail "$tag: Cargo.toml version is '$cargo_version'"
+
+            status="$(git -C src verify-tag --raw "$tag" 2>&1 >/dev/null)" \
+              || { echo "$status"; fail "$tag: tag signature did not verify"; }
+            grep -q '^\[GNUPG:\] GOODSIG ' <<<"$status" \
+              || { echo "$status"; fail "$tag: no GOODSIG"; }
+            # Last field of VALIDSIG is the primary key fingerprint.
+            signer="$(awk '$2 == "VALIDSIG" { print toupper($NF); exit }' <<<"$status")"
+            grep -qxF "$signer" <<<"$pinned" \
+              || fail "$tag: signer '$signer' is not pinned in keys/fingerprints.txt"
+            echo "signature OK, signer $signer"
+
+            # Upstream's own CI must have built this exact commit from this tag.
+            dl="$(mktemp -d)"
+            gh release download "$tag" -R "$UPSTREAM" -p "$ATTESTED_ASSET" -D "$dl"
+            gh attestation verify "$dl/$ATTESTED_ASSET" -R "$UPSTREAM" \
+              --signer-workflow "$UPSTREAM_WORKFLOW" \
+              --source-ref "refs/tags/$tag" \
+              --source-digest "$commit" \
+              --deny-self-hosted-runners >/dev/null \
+              || fail "$tag: upstream attestation does not match commit $commit"
+            echo "upstream attestation OK for commit $commit"
+            echo "::endgroup::"
+
+            builds="$(jq -c --arg t "$tag" --arg c "$commit" --arg s "$signer" \
+              '. + [{tag: $t, commit: $c, signer: $s}]' <<<"$builds")"
           done
 
-          json="$(printf '%s\n' "${todo[@]+"${todo[@]}"}" | jq -R . | jq -sc 'map(select(length > 0)) | reverse')" # oldest first
-          echo "tags=$json" >> "$GITHUB_OUTPUT"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Upstream latest: $latest; to build: $json" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Upstream latest: \`$latest\`"
+            echo
+            echo "Verified for build: \`$builds\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    needs: check
-    if: needs.check.outputs.tags != '[]'
+    needs: verify
+    if: needs.verify.outputs.builds != '[]'
     runs-on: ubuntu-22.04-arm # glibc 2.35, same baseline as upstream's x86_64 build
     timeout-minutes: 60
     permissions:
@@ -93,28 +169,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tag: ${{ fromJSON(needs.check.outputs.tags) }}
+        include: ${{ fromJSON(needs.verify.outputs.builds) }}
     steps:
-      - name: Check out upstream at tag
+      - name: Check out verified upstream commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: refs/tags/${{ matrix.tag }}
+          ref: ${{ matrix.commit }}
           path: src
           persist-credentials: false
 
-      - name: Validate version
+      - name: Confirm checkout
         working-directory: src
         env:
           TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
         run: |
           set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "HEAD is not $COMMIT" >&2; exit 1; }
           cargo_version="$(grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)"
-          [ "$cargo_version" = "${TAG#v}" ] || {
-            echo "Cargo.toml version $cargo_version does not match $TAG" >&2; exit 1;
-          }
-          git rev-parse HEAD > ../upstream-commit.txt
-          echo "Upstream commit: $(cat ../upstream-commit.txt)"
+          [ "$cargo_version" = "${TAG#v}" ] || { echo "version mismatch" >&2; exit 1; }
 
       - name: Install build and sandbox prerequisites
         run: |
@@ -141,8 +215,6 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          # Installs the channel from upstream's rust-toolchain.toml
-          # (falls back to stable if the file is absent).
           if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
             rustup toolchain install
           else
@@ -166,14 +238,35 @@ jobs:
           file "$bin" | grep -q 'ARM aarch64' || { echo "not an aarch64 binary" >&2; exit 1; }
           "$bin" --version
 
+      - name: Write BUILD-INFO
+        env:
+          TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
+          SIGNER: ${{ matrix.signer }}
+        run: |
+          set -eu
+          # Shipped inside the tarball and .deb, so the attested artifact
+          # digest covers the upstream source identity.
+          cat > src/BUILD-INFO <<EOF
+          project: ai-jail (unofficial linux-aarch64 build)
+          upstream_repo: https://github.com/${UPSTREAM}
+          upstream_tag: ${TAG}
+          upstream_commit: ${COMMIT}
+          upstream_tag_signer: ${SIGNER}
+          build_repo: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          build_commit: ${GITHUB_SHA}
+          build_run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          build_runner: ${RUNNER_OS}-${RUNNER_ARCH} (${ImageOS:-unknown} ${ImageVersion:-})
+          EOF
+          cat src/BUILD-INFO
+
       - name: Archive and checksum
         run: |
           set -eu
-          mkdir -p out
-          tar czf out/ai-jail-linux-aarch64.tar.gz \
-            -C src/target/aarch64-unknown-linux-gnu/release ai-jail
+          mkdir -p out stage
+          cp src/target/aarch64-unknown-linux-gnu/release/ai-jail src/BUILD-INFO stage/
+          tar czf out/ai-jail-linux-aarch64.tar.gz -C stage ai-jail BUILD-INFO
           (cd out && sha256sum ai-jail-linux-aarch64.tar.gz > ai-jail-linux-aarch64.tar.gz.sha256)
-          cp upstream-commit.txt out/
 
       - name: Build Debian package (arm64)
         env:
@@ -185,15 +278,19 @@ jobs:
             echo "::warning::$TAG has no packaging/debian/build-deb.sh; skipping .deb"
             exit 0
           fi
-          # Reuse upstream's packaging script verbatim except for the arch,
-          # so control-file changes upstream flow through automatically.
-          sed 's/amd64/arm64/g' "$script" > src/packaging/debian/build-deb-arm64.sh
+          # Reuse upstream's packaging script except for the arch, and add
+          # BUILD-INFO next to the copyright file.
+          sed -e 's/amd64/arm64/g' \
+              -e '/usr\/share\/doc\/ai-jail\/copyright"/a install -Dm0644 "$repo_root/BUILD-INFO" "$stage/usr/share/doc/ai-jail/BUILD-INFO"' \
+              "$script" > src/packaging/debian/build-deb-arm64.sh
           chmod +x src/packaging/debian/build-deb-arm64.sh
           ./src/packaging/debian/build-deb-arm64.sh "${TAG#v}" \
             src/target/aarch64-unknown-linux-gnu/release/ai-jail out
           deb="out/ai-jail_${TAG#v}_arm64.deb"
           arch="$(dpkg-deb -f "$deb" Architecture)"
           [ "$arch" = arm64 ] || { echo "deb Architecture is '$arch', expected arm64" >&2; exit 1; }
+          dpkg-deb -c "$deb" | grep -q '/usr/share/doc/ai-jail/BUILD-INFO$' \
+            || { echo "BUILD-INFO missing from .deb (upstream script changed?)" >&2; exit 1; }
           dpkg-deb -I "$deb"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -203,9 +300,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check, build]
-    if: ${{ !cancelled() && needs.check.outputs.tags != '[]' }}
+    needs: [verify, build]
+    if: ${{ !cancelled() && needs.verify.outputs.builds != '[]' }}
     runs-on: ubuntu-latest
+    environment: release-publish # requires manual approval
     permissions:
       contents: write
       id-token: write
@@ -214,7 +312,7 @@ jobs:
       fail-fast: false
       max-parallel: 1 # publish oldest-first so "Latest" ends up correct
       matrix:
-        tag: ${{ fromJSON(needs.check.outputs.tags) }}
+        include: ${{ fromJSON(needs.verify.outputs.builds) }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -238,17 +336,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ matrix.tag }}
+          COMMIT: ${{ matrix.commit }}
+          SIGNER: ${{ matrix.signer }}
         run: |
           set -euo pipefail
-          commit="$(cat artifacts/upstream-commit.txt)"
           version="${TAG#v}"
-          repo_url="https://github.com/${GITHUB_REPOSITORY}"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           upstream_url="https://github.com/${UPSTREAM}"
           {
             echo "Unofficial **Linux ARM64 (aarch64)** build of [ai-jail ${TAG}](${upstream_url}/releases/tag/${TAG})."
             echo
-            echo "Built unmodified from upstream commit [\`${commit:0:12}\`](${upstream_url}/commit/${commit}) on a native \`ubuntu-22.04-arm\` GitHub runner (requires glibc ≥ 2.35)."
+            echo "Built unmodified from upstream commit [\`${COMMIT:0:12}\`](${upstream_url}/commit/${COMMIT}) on a native \`ubuntu-22.04-arm\` GitHub runner (requires glibc ≥ 2.35)."
             echo "Not affiliated with or endorsed by the upstream project."
+            echo
+            echo "Before building, the upstream tag was checked: annotated, signed by pinned key \`${SIGNER}\`, reachable from upstream's default branch, and matching the commit in upstream's own build attestation."
+            echo "The upstream commit is recorded in \`BUILD-INFO\` inside the tarball and in \`/usr/share/doc/ai-jail/BUILD-INFO\` in the .deb."
             echo
             echo "## Install"
             echo '```bash'
@@ -263,7 +365,9 @@ jobs:
             echo
             echo "## Verify"
             echo '```bash'
-            echo "gh attestation verify ai-jail-linux-aarch64.tar.gz -R ${GITHUB_REPOSITORY}"
+            echo "gh attestation verify ai-jail-linux-aarch64.tar.gz -R ${GITHUB_REPOSITORY} \\"
+            echo "  --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release-arm.yml"
+            echo "tar xzf ai-jail-linux-aarch64.tar.gz BUILD-INFO && cat BUILD-INFO"
             echo '```'
             echo
             echo "## Checksums (SHA256)"
@@ -273,29 +377,34 @@ jobs:
             echo
             echo "---"
             echo
-            echo "## Upstream release notes"
+            echo "<details><summary>Upstream release notes (written for upstream's x86_64/macOS assets)</summary>"
             echo
             gh release view "$TAG" -R "$UPSTREAM" --json body --jq .body
+            echo
+            echo "</details>"
           } > body.md
           cat body.md
 
-      - name: Publish release
+      - name: Publish release (create-only, never overwrite)
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ matrix.tag }}
-          LATEST: ${{ needs.check.outputs.latest }}
+          LATEST: ${{ needs.verify.outputs.latest }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           assets=(artifacts/*.tar.gz artifacts/*.deb artifacts/*.sha256)
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release exists; replacing assets and notes"
-            gh release upload "$TAG" "${assets[@]}" -R "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file body.md
-          else
-            latest_flag="--latest=false"
-            [ "$TAG" = "$LATEST" ] && latest_flag="--latest"
-            gh release create "$TAG" "${assets[@]}" -R "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "$TAG (arm64)" \
-              --notes-file body.md "$latest_flag"
-          fi
+          draft="$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          case "$draft" in
+            false)
+              echo "::error::$TAG is already published here; releases are immutable" >&2
+              exit 1 ;;
+            true)
+              echo "Removing leftover draft from an interrupted run"
+              gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag ;;
+          esac
+          latest_flag="--latest=false"
+          [ "$TAG" = "$LATEST" ] && latest_flag="--latest"
+          gh release create "$TAG" "${assets[@]}" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "$TAG (arm64)" \
+            --notes-file body.md "$latest_flag"
